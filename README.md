@@ -1,8 +1,7 @@
-<<<<<<< HEAD
 # WeatherTrackerCodex
 Codex Weather Tracking App
 =======
-# Weather Tracker (Greenville, SC)
+# Weather Tracker 
 
 Simple .NET 10 console app that calls the free Weather.gov API and prints:
 
@@ -33,4 +32,3 @@ dotnet run
   - `forecastHourly` URL from points response
   - `forecast` URL from points response
 - Weather.gov does not provide explicit sunrise/sunset in these forecast endpoints, so the app labels them as estimates.
->>>>>>> aa6403c (Initial commit)
