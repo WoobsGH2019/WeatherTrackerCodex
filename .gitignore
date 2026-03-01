@@ -23,6 +23,11 @@ bld/
 [Ll]og/
 [Ll]ogs/
 
+# Remove Directories
+bin/
+obj/
+Scratch/
+
 # .NET Core
 project.lock.json
 project.fragment.lock.json
@@ -53,5 +58,3 @@ CodeCoverage/
 TestResult.xml
 nunit-*.xml
 
-# Scratch
-Scratch/
