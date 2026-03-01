@@ -1,239 +1,163 @@
-using System.Net.Http.Json;
-using System.Text.Json.Serialization;
+using System.Net;
+using Microsoft.Extensions.Options;
+using WeatherTracker.Configuration;
+using WeatherTracker.Services;
 
-const string baseUrl = "https://api.weather.gov";
-const int hoursToDisplay = 24;
+var builder = WebApplication.CreateBuilder(args);
 
-var cities = new[]
+builder.Services.AddHttpClient<WeatherGovClient>(httpClient =>
 {
-    new City("Greenville, SC", 34.8526, -82.3940),
-    new City("Redmond, WA", 47.6770, -122.1180),
-    new City("New Braunfels, TX", 29.7046, -98.1039),
-    new City("Washington, DC", 38.8979, -77.0365)
-};
+    httpClient.BaseAddress = new Uri("https://api.weather.gov");
+    httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("WeatherTrackerCodex/1.0 (+mailto:RobertGithub@wubortsoft.com)");
+    httpClient.DefaultRequestHeaders.Add("Accept", "application/geo+json");
+});
 
-using var httpClient = new HttpClient
+builder.Services
+    .AddOptions<WeatherSettings>()
+    .Bind(builder.Configuration.GetSection(WeatherSettings.SectionName))
+    .Validate(settings => settings.HoursToDisplay > 0, "HoursToDisplay must be greater than 0.")
+    .Validate(settings => settings.Cities.Count > 0, "At least one city is required.")
+    .ValidateOnStart();
+
+var app = builder.Build();
+
+app.MapGet("/api/weather", async (WeatherGovClient weatherGovClient, IOptions<WeatherSettings> weatherSettings) =>
 {
-    BaseAddress = new Uri(baseUrl)
-};
+    var settings = weatherSettings.Value;
+    var cities = settings.Cities.Select(ToDomainCity);
+    var report = await weatherGovClient.GetReportAsync(cities, settings.HoursToDisplay);
+    return Results.Ok(report);
+});
 
-httpClient.DefaultRequestHeaders.Add("User-Agent", "RobertGithub@wubortsoft.com");
-httpClient.DefaultRequestHeaders.Add("Accept", "application/geo+json");
-
-try
+app.MapGet("/api/weather/{cityName}", async (string cityName, WeatherGovClient weatherGovClient, IOptions<WeatherSettings> weatherSettings) =>
 {
-    Console.WriteLine("Weather.gov hourly forecast");
-    Console.WriteLine($"Generated: {DateTimeOffset.Now:yyyy-MM-dd HH:mm zzz}");
-    Console.WriteLine();
+    var settings = weatherSettings.Value;
+    var selectedCity = settings.Cities.FirstOrDefault(city =>
+        string.Equals(city.CityName, cityName, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(GetDisplayName(city), cityName, StringComparison.OrdinalIgnoreCase));
 
-    foreach (var city in cities)
+    if (selectedCity is null)
     {
-        var pointData = await GetPointDataAsync(httpClient, city.Latitude, city.Longitude);
-
-        if (string.IsNullOrWhiteSpace(pointData.Properties?.ForecastHourly) ||
-            string.IsNullOrWhiteSpace(pointData.Properties.Forecast))
+        return Results.NotFound(new
         {
-            Console.Error.WriteLine($"[{city.Name}] Point response did not include forecast links.");
-            Console.WriteLine();
-            continue;
-        }
-
-        var hourly = await GetForecastAsync(httpClient, pointData.Properties.ForecastHourly);
-        var daily = await GetForecastAsync(httpClient, pointData.Properties.Forecast);
-
-        if (hourly.Properties?.Periods is null || hourly.Properties.Periods.Length == 0)
-        {
-            Console.Error.WriteLine($"[{city.Name}] Hourly forecast response did not contain periods.");
-            Console.WriteLine();
-            continue;
-        }
-
-        Console.WriteLine(city.Name);
-        Console.WriteLine($"Coordinates: {city.Latitude:F6},{city.Longitude:F6}");
-        PrintSunEvents(daily, pointData.Properties.TimeZone);
-        Console.WriteLine();
-
-        var maxRows = Math.Min(hoursToDisplay, hourly.Properties.Periods.Length);
-        for (var i = 0; i < maxRows; i++)
-        {
-            var period = hourly.Properties.Periods[i];
-            var temperatureUnit = period.TemperatureUnit ?? "F";
-            var shortForecast = period.ShortForecast ?? "Unknown";
-            var condition = ClassifyCondition(shortForecast);
-
-            Console.WriteLine($"{period.StartTime,-25} {period.Temperature,3}{temperatureUnit,-2} {condition,-8}  {shortForecast}");
-        }
-
-        Console.WriteLine();
+            Message = $"City '{cityName}' was not found.",
+            AvailableCities = settings.Cities.Select(GetDisplayName)
+        });
     }
-}
-catch (HttpRequestException ex)
+
+    var report = await weatherGovClient.GetReportAsync(
+    [
+        ToDomainCity(selectedCity)
+    ], settings.HoursToDisplay);
+
+    var cityReport = report.Cities.FirstOrDefault();
+    return cityReport is null
+        ? Results.Problem("No report data was returned for the selected city.")
+        : Results.Ok(cityReport);
+});
+
+app.MapGet("/", async (WeatherGovClient weatherGovClient, IOptions<WeatherSettings> weatherSettings) =>
 {
-    Console.Error.WriteLine($"Request failed: {ex.Message}");
-    Environment.Exit(1);
-}
-catch (Exception ex)
+    var settings = weatherSettings.Value;
+    var cities = settings.Cities.Select(ToDomainCity);
+    var hoursToDisplay = settings.HoursToDisplay;
+    var report = await weatherGovClient.GetReportAsync(cities, hoursToDisplay);
+    return Results.Content(RenderHtml(report), "text/html");
+});
+
+app.Run();
+
+static string RenderHtml(WeatherReport report)
 {
-    Console.Error.WriteLine($"Unexpected error: {ex.Message}");
-    Environment.Exit(1);
+    var generatedAt = WebUtility.HtmlEncode(report.GeneratedAt.ToString("yyyy-MM-dd HH:mm zzz"));
+    var body = $$"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Weather Tracker</title>
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 0; font-family: "Segoe UI", Tahoma, sans-serif; background: #f6f9fc; color: #1f2937; }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { margin: 0 0 8px; font-size: 1.8rem; }
+    .meta { margin: 0 0 20px; color: #4b5563; }
+    .city { background: #fff; border: 1px solid #dbe3ef; border-radius: 10px; padding: 14px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0, 0, 0, .04); }
+    .city h2 { margin: 0 0 6px; font-size: 1.2rem; }
+    .coords { color: #4b5563; margin: 0 0 8px; }
+    .sun { margin: 0 0 10px; font-size: .95rem; color: #374151; }
+    .error { color: #b91c1c; margin: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+    th, td { text-align: left; padding: 6px 8px; border-top: 1px solid #e5e7eb; vertical-align: top; }
+    th { background: #f8fafc; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Weather.gov Hourly Forecast</h1>
+    <p class="meta">Generated: {{generatedAt}}</p>
+    {{string.Join(Environment.NewLine, report.Cities.Select(RenderCitySection))}}
+  </main>
+</body>
+</html>
+""";
+
+    return body;
 }
 
-return;
-
-static async Task<PointResponse> GetPointDataAsync(HttpClient httpClient, double latitude, double longitude)
+static string RenderCitySection(CityWeatherReport city)
 {
-    var endpoint = $"/points/{latitude.ToString("F8", System.Globalization.CultureInfo.InvariantCulture)},{longitude.ToString("F8", System.Globalization.CultureInfo.InvariantCulture)}";
-    var result = await httpClient.GetFromJsonAsync<PointResponse>(endpoint);
-    return result ?? throw new InvalidOperationException("Empty points response payload.");
-}
+    var cityName = WebUtility.HtmlEncode(city.CityName);
+    var coordinates = WebUtility.HtmlEncode($"{city.Latitude:F6},{city.Longitude:F6}");
 
-static async Task<ForecastResponse> GetForecastAsync(HttpClient httpClient, string endpointOrUrl)
-{
-    var result = await httpClient.GetFromJsonAsync<ForecastResponse>(endpointOrUrl);
-    return result ?? throw new InvalidOperationException("Empty forecast response payload.");
-}
-
-static void PrintSunEvents(ForecastResponse daily, string? timeZoneId)
-{
-    if (daily.Properties?.Periods is null || daily.Properties.Periods.Length == 0)
+    if (!string.IsNullOrWhiteSpace(city.Error))
     {
-        Console.WriteLine("Sunrise: n/a");
-        Console.WriteLine("Sunset : n/a");
-        return;
+        var error = WebUtility.HtmlEncode(city.Error);
+        return $$"""
+<section class="city">
+  <h2>{{cityName}}</h2>
+  <p class="coords">Coordinates: {{coordinates}}</p>
+  <p class="error">{{error}}</p>
+</section>
+""";
     }
 
-    var tz = ResolveTimeZoneOrDefault(timeZoneId);
-    var nowLocal = TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, tz);
-    var today = DateOnly.FromDateTime(nowLocal.DateTime);
+    var sunrise = city.Sunrise is null
+        ? "n/a"
+        : WebUtility.HtmlEncode(city.Sunrise.Value.ToString("yyyy-MM-dd HH:mm zzz"));
+    var sunset = city.Sunset is null
+        ? "n/a"
+        : WebUtility.HtmlEncode(city.Sunset.Value.ToString("yyyy-MM-dd HH:mm zzz"));
 
-    var todayPeriods = daily.Properties.Periods
-        .Where(p => DateOnly.FromDateTime(p.StartTime.Date) == today)
-        .ToArray();
-
-    var sunrise = todayPeriods.FirstOrDefault(p => p.IsDaytime)?.StartTime;
-    DateTimeOffset? sunset = null;
-
-    if (sunrise is not null)
+    var rows = string.Join(Environment.NewLine, city.Hours.Select(period =>
     {
-        sunset = todayPeriods
-            .Where(p => !p.IsDaytime && p.StartTime > sunrise.Value)
-            .Select(p => (DateTimeOffset?)p.StartTime)
-            .FirstOrDefault();
-    }
+        var start = WebUtility.HtmlEncode(period.StartTime.ToString("yyyy-MM-dd HH:mm zzz"));
+        var temp = WebUtility.HtmlEncode($"{period.Temperature}{period.TemperatureUnit}");
+        var condition = WebUtility.HtmlEncode(period.Condition);
+        var forecast = WebUtility.HtmlEncode(period.ShortForecast);
+        return $"<tr><td>{start}</td><td>{temp}</td><td>{condition}</td><td>{forecast}</td></tr>";
+    }));
 
-    if (sunrise is not null)
-    {
-        Console.WriteLine($"Sunrise (est): {sunrise.Value:yyyy-MM-dd HH:mm zzz}");
-    }
-    else
-    {
-        Console.WriteLine("Sunrise (est): n/a");
-    }
-
-    if (sunset is not null)
-    {
-        Console.WriteLine($"Sunset  (est): {sunset.Value:yyyy-MM-dd HH:mm zzz}");
-    }
-    else
-    {
-        Console.WriteLine("Sunset  (est): n/a");
-    }
+    return $$"""
+<section class="city">
+  <h2>{{cityName}}</h2>
+  <p class="coords">Coordinates: {{coordinates}}</p>
+  <p class="sun">Sunrise (est): {{sunrise}} | Sunset (est): {{sunset}}</p>
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Temp</th><th>Bucket</th><th>Forecast</th></tr>
+    </thead>
+    <tbody>
+      {{rows}}
+    </tbody>
+  </table>
+</section>
+""";
 }
 
-static TimeZoneInfo ResolveTimeZoneOrDefault(string? timeZoneId)
-{
-    if (!string.IsNullOrWhiteSpace(timeZoneId))
-    {
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
-        }
-        catch (TimeZoneNotFoundException)
-        {
-        }
-        catch (InvalidTimeZoneException)
-        {
-        }
-    }
+static City ToDomainCity(CitySettings citySettings) =>
+    new(GetDisplayName(citySettings), citySettings.Latitude, citySettings.Longitude);
 
-    return TimeZoneInfo.Local;
-}
-
-static string ClassifyCondition(string forecastText)
-{
-    if (forecastText.Contains("rain", StringComparison.OrdinalIgnoreCase) ||
-        forecastText.Contains("shower", StringComparison.OrdinalIgnoreCase) ||
-        forecastText.Contains("thunder", StringComparison.OrdinalIgnoreCase))
-    {
-        return "Raining";
-    }
-
-    if (forecastText.Contains("snow", StringComparison.OrdinalIgnoreCase) ||
-        forecastText.Contains("flurr", StringComparison.OrdinalIgnoreCase) ||
-        forecastText.Contains("sleet", StringComparison.OrdinalIgnoreCase))
-    {
-        return "Snowing";
-    }
-
-    if (forecastText.Contains("sun", StringComparison.OrdinalIgnoreCase) ||
-        forecastText.Contains("clear", StringComparison.OrdinalIgnoreCase))
-    {
-        return "Sunny";
-    }
-
-    if (forecastText.Contains("cloud", StringComparison.OrdinalIgnoreCase) ||
-        forecastText.Contains("overcast", StringComparison.OrdinalIgnoreCase))
-    {
-        return "Cloudy";
-    }
-
-    return "Other";
-}
-
-public sealed class PointResponse
-{
-    [JsonPropertyName("properties")]
-    public PointProperties? Properties { get; init; }
-}
-
-public sealed class PointProperties
-{
-    [JsonPropertyName("forecast")]
-    public string? Forecast { get; init; }
-
-    [JsonPropertyName("forecastHourly")]
-    public string? ForecastHourly { get; init; }
-
-    [JsonPropertyName("timeZone")]
-    public string? TimeZone { get; init; }
-}
-
-public sealed class ForecastResponse
-{
-    [JsonPropertyName("properties")]
-    public ForecastProperties? Properties { get; init; }
-}
-
-public sealed class ForecastProperties
-{
-    [JsonPropertyName("periods")]
-    public ForecastPeriod[]? Periods { get; init; }
-}
-
-public sealed class ForecastPeriod
-{
-    [JsonPropertyName("startTime")]
-    public DateTimeOffset StartTime { get; init; }
-
-    [JsonPropertyName("temperature")]
-    public int Temperature { get; init; }
-
-    [JsonPropertyName("temperatureUnit")]
-    public string? TemperatureUnit { get; init; }
-
-    [JsonPropertyName("shortForecast")]
-    public string? ShortForecast { get; init; }
-
-    [JsonPropertyName("isDaytime")]
-    public bool IsDaytime { get; init; }
-}
+static string GetDisplayName(CitySettings citySettings) =>
+    $"{citySettings.CityName}, {citySettings.StateName}";
